@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import math
 
 # Glare detection parameters
 GLARE_THRESHOLD = 200    # Brightness threshold (0-255)
@@ -113,6 +114,82 @@ def verify_lens_features(roi, radius):
     
     return edge_score > Config.CIRCLE_SCORE * 255
 
+def detect_lens_flare(frame):
+    """
+    Detect lens flare artifacts 
+    Returns: (has_flare, processed_frame)
+    """
+    class Config:
+        LENS_FLARE_BRIGHTNESS = 200
+        GAMMA_VALUE = 20
+
+    # State persistence initialization
+    if not hasattr(detect_lens_flare, "last_flare"):
+        detect_lens_flare.last_flare = False
+        detect_lens_flare.has_new_ellipse = False  # New state flag
+
+    # Detection logic
+    current_flare = False
+    hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+    _, l, _ = cv2.split(hls)
+    
+    if np.mean(l) > Config.LENS_FLARE_BRIGHTNESS:
+        cv2.putText(frame, "High Brightness", (10, 150), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        current_flare = True
+    else:
+        # Ellipse detection logic
+        blur = cv2.medianBlur(frame, 3)
+        gray = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
+        
+        gamma = Config.GAMMA_VALUE
+        lookup_table = np.array([np.clip(pow(i/255.0, gamma)*255.0, 0, 255) 
+                               for i in range(256)], dtype=np.uint8)
+        gamma_gray = cv2.LUT(gray, lookup_table)
+        
+        _, thresh = cv2.threshold(gamma_gray, 0, 255, 
+                                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        edges = cv2.Canny(thresh, 600, 100, 3)
+        contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in contours:
+            if len(cnt) > 150:
+                area = cv2.contourArea(cnt)
+                if area < 100:
+                    continue
+                
+                try:
+                    ell = cv2.fitEllipse(cnt)
+                except:
+                    continue
+                
+                (x, y), (ma, MA), angle = ell
+                if ma == 0 or MA == 0:
+                    continue
+                
+                ellipse_area = math.pi * (ma/2) * (MA/2)
+                if ellipse_area == 0:
+                    continue
+                
+                area_ratio = area / ellipse_area
+                axis_ratio = max(ma, MA) / min(ma, MA)
+                
+                if area_ratio > 0.2 and axis_ratio < 2:
+                    cv2.ellipse(frame, ell, (0, 255, 255), 2)
+                    current_flare = True
+                    detect_lens_flare.has_new_ellipse = True  # Mark new detection
+
+    # State persistence logic
+    if detect_lens_flare.has_new_ellipse:
+        detect_lens_flare.last_flare = current_flare
+        detect_lens_flare.has_new_ellipse = False
+    elif current_flare:
+        detect_lens_flare.last_flare = True
+        detect_lens_flare.has_new_ellipse = True
+
+    return detect_lens_flare.last_flare, frame
+    
 def main():
     cap = cv2.VideoCapture(1)
     
@@ -133,14 +210,17 @@ def main():
         Config.MAX_RADIUS = cv2.getTrackbarPos('Max Radius', 'Control Panel')
         
         # Detection processing
-        _, glare_frame = detect_glare(frame)
-        has_lens, result_frame = detect_lens(glare_frame)
+        has_glare, glare_frame = detect_glare(frame)
+        has_lens, lens_frame = detect_lens(glare_frame)
+        has_flare, result_frame = detect_lens_flare(lens_frame)
         
         # Display status
-        status = f"Lens: {'Found' if has_lens else 'Searching'}"
-        cv2.putText(result_frame, status, (10,60), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-        
+        cv2.putText(result_frame, f"Glare: {'Yes' if has_glare else 'No'}", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(result_frame, f"Lens: {'Found' if has_lens else 'Searching'}", (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(result_frame, f"Flare: {'Detected' if has_flare else 'Clear'}", (10, 90), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         cv2.imshow('Lens Detection', result_frame)
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
